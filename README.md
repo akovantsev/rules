@@ -16,6 +16,8 @@ beta quality
 ## Usage example
 https://github.com/akovantsev/rules/blob/main/test/com/akovantsev/rules/test.clj#L56
 
+https://gist.github.com/akovantsev/61476fe57dd8d11c1a492a1a1e82c31a
+
 ## Rule
 
 ```clojure
