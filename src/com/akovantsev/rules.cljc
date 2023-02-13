@@ -1,10 +1,14 @@
 (ns com.akovantsev.rules
-  #?(:cljs (:require-macros [com.akovantsev.rules :refer [parse-rule]])))
+  #?(:cljs (:require-macros [com.akovantsev.rules :refer [rule]]))
+  (:require [clojure.walk :as walk]))
 
 (def -conjs (fnil conj #{}))
 (def -conjv (fnil conj []))
 (def -plus  (fnil + 0))
 
+
+(defn -prewalk-replace [smap form] ;; for cljs, copy of from clojure.walk/prewalk-replace
+  (walk/prewalk (fn [x] (if (contains? smap x) (smap x) x)) form))
 
 (defn -parse-tuple [locals [t e a v f & args :as raw]]
   (let [deps (->> args (tree-seq coll? seq) (filter locals) set)
@@ -19,7 +23,7 @@
       (when f
         (let [gargs (filter locals (conj deps v))
               call  (if (some #{'%} args)
-                      `(~f ~@(replace {'% v} args))
+                      `(~f ~@(-prewalk-replace {'% v} args))
                       `(~f ~v ~@args))
               guard (if (seq gargs)
                       `(fn [{:syms [~@gargs] :as ~'match}] ~call)
@@ -34,9 +38,8 @@
 
 
 #?(:clj
-   (defmacro parse-rule [rulev]
-     (let [[rname & tail] rulev
-           [tuplevs & pairs] (partition-by #{:foreach :forall} tail)
+   (defmacro rule [rule-id & rule-body]
+     (let [[tuplevs & pairs] (partition-by #{:foreach :forall} rule-body)
            mpairs    (apply hash-map pairs)
            ;_ (prn mpairs)
            foreach   (get mpairs '(:foreach))
@@ -47,7 +50,7 @@
                            (symbol? e) (update :locals update e -plus 1)
                            (symbol? v) (update :locals update v -plus 1)
                            (= t :new)  (update :watch-attrs conj a)))
-                       {:rule-id     rname
+                       {:rule-id     rule-id
                         :locals      {}
                         :watch-attrs #{}}
                        tuplevs)
@@ -73,14 +76,19 @@
 
 (defn -insert [db m old?]
   (let [rf (fn [db id kvs]
-             (let [{:keys [:a->rules :aev-new]} db]
+             (let [{:keys [:a->rules :aev-new :temp]} db]
                (reduce-kv
                  (fn [m k v]
-                   (let [tri? (seq (get a->rules k))]
+                   ;(prn 'assoc k v)
+                   (let [tri? (seq (get a->rules k))
+                         pair [id k]
+                         acc? (and (not old?) (not (contains? temp pair)))]
                      (-> m
                        (assoc-in [:aev-new k id] v)
                        (cond->
                          old? (assoc-in [:aev-old k id] (-> aev-new (get k) (get id)))
+                         acc? (assoc-in [:aev-old k id] (-> aev-new (get k) (get id)))
+                         acc? (update :temp -conjs pair)
                          tri? (update :triggered -conjs k)))))
                  db kvs)))]
     (reduce-kv rf db m)))
@@ -90,12 +98,16 @@
   ([db id-k-f old?] (reduce-kv #(-change %1 %2 %3 old?) db id-k-f))
   ([db id k-f old?] (reduce-kv #(-change %1 id %2 %3 nil old?) db k-f))
   ([db id k f args old?]
-   (let [{:keys [:a->rules :aev-new]} db
+   (let [{:keys [:a->rules :aev-new :temp]} db
+         pair [id k]
+         acc? (and (not old?) (not (contains? temp pair)))
          tri? (seq (get a->rules k))]
      (as-> db db
        (apply update-in db [:aev-new k id] f args)
        (cond-> db
          old? (assoc-in [:aev-old k id] (-> aev-new (get k) (get id)))
+         acc? (assoc-in [:aev-old k id] (-> aev-new (get k) (get id)))
+         acc? (update :temp -conjs pair)
          tri? (update :triggered -conjs k))))))
 
 
@@ -110,9 +122,12 @@
   ([db id k f & args] (-change db id k f args false)))
 
 (defn init
-  ([db m]      (as-> db db (insert db m)      (assoc db :aev-old (:aev-new db))))
-  ([db id kvs] (as-> db db (insert db id kvs) (assoc db :aev-old (:aev-new db))))
-  ([db id k v] (as-> db db (insert db id k v) (assoc db :aev-old (:aev-new db)))))
+  ([db m] (init db m nil))
+  ([db m callbacks]
+   (as-> db db
+     (insert db m)
+     (assoc db :aev-old (:aev-new db))
+     (assoc db ::callbacks callbacks))))
 
 (defn by-id [db id]
   (let [m (reduce-kv
@@ -148,6 +163,7 @@
     ;(prn [kind t e a v] matches)
     (let [aev (if (= t :old) aev-old aev-new)
           ev  (get aev a)]
+      ;(prn aev)
       (if (empty? ev)
         (reduced [])
         (case kind
@@ -213,23 +229,32 @@
                               (map (fn [[E V]] (assoc m e E v V)) ev)))))))))))))
 
 
-(defn query [db rule-id]
-  (let [rulem  (-> db :rules (get rule-id))
-        _      (assert rulem (str "no such rule in db: " rule-id))
-        tuples (:tuples rulem)
-        mrf    (-make-match-rf (:aev-old db) (:aev-new db))
-        rf     (fn [matches tuple]
-                 (let [matches (mrf matches tuple)]
-                   ;(prn 'matching-tuple (:raw tuple))
-                   ;(prn 'matches matches)
-                   matches))
-        guards (some->> tuples
-                 (filter :guard-fn)
-                 (map #(fn [m]
-                         (if ((:guard-fn %) m)
-                           m)))
-                 ;(prn 'failed-guard (:guard-form %)))))
-                 seq (apply every-pred))]
+(defn query [db rule-id & [callbacks]]
+  (let [callbacks (-> db ::callbacks (merge callbacks))
+        cb-brq    (::cb-before-rule-query callbacks)
+        cb-atm    (::cb-after-tuple-match callbacks)
+        cb-agm    (::cb-after-guard-match callbacks)
+        rulem     (-> db :rules (get rule-id))
+        _         (assert rulem (str "no such rule in db: " rule-id))
+        tuples    (:tuples rulem)
+        mrf       (-make-match-rf (:aev-old db) (:aev-new db))
+        rf        (if-not cb-atm
+                    mrf
+                    (fn [ms t]
+                      (let [ms* (mrf ms t)]
+                        (when cb-atm (cb-atm {::db db ::rule rulem ::tuple t ::matches-before ms ::matches-after ms*}))
+                        ms*)))
+        mk-guard  (if-not cb-agm
+                    (fn [t] (fn [m] (when ((:guard-fn t) m) m)))
+                    (fn [t] (fn [m] (let [m* (when ((:guard-fn t) m) m)]
+                                      (cb-agm {::db db ::rule rulem ::tuple t ::match-before m ::match-after m*})
+                                      m*))))
+        guards    (some->> tuples
+                    (filter :guard-fn)
+                    (map mk-guard)
+                    seq
+                    (apply every-pred))]
+    (when cb-brq (cb-brq {::db db ::rule rulem}))
     (seq
       (cond->> (reduce rf nil tuples)
         guards (filter guards)))))
@@ -259,10 +284,12 @@
 
 
 (defn -exec-rule [db rule-id]
-  (let [rule  (-> db :rules (get rule-id))
-        onefn (:then-fn rule)
-        allfn (:once-fn rule)]
-    ;(prn 'exec-rule rule-id)
+  (let [rule   (-> db :rules (get rule-id))
+        cbs    (::callbacks db)
+        cb-ber (::cb-before-rule-exec cbs)
+        onefn  (:then-fn rule)
+        allfn  (:once-fn rule)]
+    (when cb-ber (cb-ber {::db db ::rule rule}))
     (if-not (or onefn allfn)
       db ;; dont exec just-queries
       (let [matches (query db rule-id)]
@@ -278,21 +305,31 @@
 
 
 (defn fire-rules [db & [opts]]
-  (let [{:keys [::depth-limit
+  (let [{:keys [::callbacks
+                ::depth-limit
                 ::only-rule-ids
                 ::ignore-rule-ids]} opts
-        limit (or depth-limit 10)]
+        limit          (or depth-limit 10)
+        orig-callbacks (::callbacks db)
+        db*            (update db ::callbacks merge callbacks)
+        callbacks*     (::callbacks db*)
+        cb-bfr         (::cb-before-fire-rules callbacks*)
+        cb-afr         (::cb-after-fire-rules callbacks*)
+        triggered-ids  (-ord-triged-rules-ids db)]
     ; old ≠ new at this point
-    (loop [db    db
-           ids   (-ord-triged-rules-ids db)]
+    (when cb-bfr (cb-bfr {::db db ::triggered-rule-ids triggered-ids}))
+    (loop [db    db*
+           ids   triggered-ids]
       (cond
         (and (not= limit ##Inf) (<= limit (reduce max 0 (vals (:calls db)))))
         (throw (ex-info "recur limit hit" {'db db}))
 
         (empty? ids)
-        (-> db
-          (assoc :aev-old (:aev-new db))
-          (dissoc :calls))
+        (do
+          (when cb-afr (cb-afr {::db db}))
+          (-> db
+            (assoc ::callbacks orig-callbacks)
+            (dissoc :calls :temp)))
 
         :else
         (let [id     (first ids)

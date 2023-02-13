@@ -18,22 +18,21 @@ https://github.com/akovantsev/rules/blob/main/test/com/akovantsev/rules/test.clj
 
 https://gist.github.com/akovantsev/61476fe57dd8d11c1a492a1a1e82c31a
 
-## Rule
+## Rule example
 
 ```clojure
 (def autoinc
-  (r/parse-rule                  ;; macro
-    [::foo                       ;; rule-id
+   (r/rule ::foo                 ;; macro,  rule-id
      [:new id :x x < 5]          ;; find all ids whos :x is < 5
      [:let id :y y]              ;; join on id, where :y is not nil
      [:old id :x ox not= x]      ;; join on id, where prev :x val ≠ curr :x val
 
      :foreach                    ;; for each match {:id ... :x ... :y ...}:
      (prn :foreach1 match)       ;; print match map
-     (r/change! id :x inc)       ;; (update current-db id :x inc)
+     (r/change! id :x inc)       ;; ~ (update current-db id :x inc)
 
      :forall                     ;; once, for matches seq ({:id ... :x ... :y ...} ...):
-     (println :once1 matches)])) ;; print matches
+     (println :once1 matches))) ;; print matches
 ```
 
 ## about
@@ -57,8 +56,10 @@ and don't keep another `db` map on the side.
 [:old foo ::left-of obar]
 ```
 
-### LHS/query/tuples format
-Tuples' order within rule does not matter. Tuples are sorted during rule parsing.
+### Query / LHS format
+Tuples' order within rule does not matter.
+<br>Tuples are rearranged during rule parsing.
+
 ```clojure
 [tuple-type e a v]
 [tuple-type e a v f & args]
@@ -78,8 +79,7 @@ Tuples' order within rule does not matter. Tuples are sorted during rule parsing
 [:new id :b b]               ;; :new uses :b, and any :b change in db triggers the rule
 ```
 
-`triggers` - means `query/what/LHS/LeftHandSide` part of the rule is executed,
-and if there are matches - `forall/foreach/then/then-finally/RHS/RightHandSide` part of the rule is executed:
+`triggers` - means rule is queued for `query/LHS`, and if there are matches - `forall/foreach/then/then-finally/RHS/RightHandSide` part of the rule is executed:
 - first `foreach` (if present) is executed with each match from `query` part (e.g. 10 patches => 10 `foreach` calls)
 - then `forall` (if present) is executed once with all the matches (e.g. 100 matches => 1 `forall` call)
 
@@ -95,12 +95,7 @@ Guards are (additional to joins) constraints on `v` bindings (not `e` ones).
 ```
 But you can specify place with `%`.
 ```clojure
-[:new id :a a < b % (+ 10 id)]  ;; -> (fn [{:as match, :syms [a b id]}] (< b a (+ 10 id))
-[:new id :b b]
-```
-(for now) it works only on 1st level though, so this is gonna blow up with `cannot resolve %`:
-```clojure
-[:new id :a a < b (inc %) 10]  ;; -> (fn [{:as match, :syms [a b]}] (< a b (inc %) 10))
+[:new id :a a < b % (+ 10 id %)]  ;; -> (fn [{:as match, :syms [a b id]}] (< b a (+ 10 id a))
 [:new id :b b]
 ```
 
@@ -120,7 +115,7 @@ There are 2 rule callbacks available.
 ...
 [:new id :a a]
 :foreach
-(println db matches match id a)
+(println db matches match)
 (println id a)
 ;; => (fn [db matches {:as match, :syms [id a]}]
 ;;      (println db matches match)
